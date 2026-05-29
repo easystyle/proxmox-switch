@@ -97,10 +97,10 @@ app.use(requireAuth);
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Proxmox config
-const PROXMOX_HOST = 'https://127.0.0.1:8006';
-const PROXMOX_USER = 'root@pam';
-const PROXMOX_PASS = 'eD2011sD';
-const PROXMOX_NODE = 'pve';
+const PROXMOX_HOST = process.env.PROXMOX_HOST;
+const PROXMOX_USER = process.env.PROXMOX_USER;
+const PROXMOX_PASS = process.env.PROXMOX_PASS;
+const PROXMOX_NODE = process.env.PROXMOX_NODE;
 
 const SETTINGS_FILE = path.join(__dirname, 'settings.json');
 const LOG_FILE = path.join(__dirname, 'logs.json');
@@ -158,8 +158,29 @@ let nodeName = PROXMOX_NODE;
 async function detectNode() {
   try {
     const nodes = await proxmoxAPI('GET', '/api2/json/nodes');
-    if (nodes && nodes.length > 0) { nodeName = nodes[0].node; console.log(`Detected Proxmox node: ${nodeName}`); }
-  } catch (e) { console.log('Could not detect node name, using default:', PROXMOX_NODE); }
+    let foundMatch = false;
+
+    if (nodes && nodes.length > 0) {
+      // 返却されたノードリストをループし、PROXMOX_NODEと一致するか照合
+      for (const node of nodes) {
+        if (node.node === PROXMOX_NODE) {
+          nodeName = PROXMOX_NODE; // 設定されたProxmoxノードが検出された場合
+          console.log(`Detected configured Proxmox node: ${nodeName}`);
+          foundMatch = true;
+          break; // 一致するノードが見つかったらループを抜ける
+        }
+      }
+    }
+
+    if (!foundMatch) {
+      // PROXMOX_NODE が見つからなかった、またはノードリストが空だった場合
+      console.warn(`Configured Proxmox node '${PROXMOX_NODE}' not found among active nodes or no nodes returned.`);
+    }
+  } catch (e) {
+    // Proxmox APIへの接続自体に失敗した場合 (例: サーバーダウン、認証情報エラーなど)
+    console.error('Error connecting to Proxmox API or fetching nodes:', e.message);
+    console.warn(`Configured Proxmox node '${PROXMOX_NODE}' not found among active nodes or no nodes returned.`);
+  }
 }
 
 function extractPCIDevices(config) {
