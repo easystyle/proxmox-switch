@@ -245,6 +245,209 @@ function extractPCIDevices(config) {
   return devices;
 }
 
+/**
+ * 指定されたVMIDのVMの現在の情報（タイプ、ステータス、名前）を取得します。
+ * @param {number} vmid - VMID
+ * @returns {Promise<{vmid: number, type: string, status: string, name: string}>} VM情報
+ */
+async function getVMInfo(vmid) {
+  try {
+    const qemuStatus = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/qemu/${vmid}/status/current`);
+    const qemuConfig = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/qemu/${vmid}/config`);
+    return { vmid, type: 'qemu', status: qemuStatus.status, name: qemuConfig.name || `VM ${vmid}` };
+  } catch (e) {
+    // qemuでなければlxcを試す
+    try {
+      const lxcStatus = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/lxc/${vmid}/status/current`);
+      const lxcConfig = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/lxc/${vmid}/config`);
+      return { vmid, type: 'lxc', status: lxcStatus.status, name: lxcConfig.hostname || `CT ${vmid}` };
+    } catch (e) {
+      // どちらでもない場合、VMは存在しないかアクセス不能
+      return null;
+    }
+  }
+}
+
+/**
+ * 指定されたVMIDとタイプのVMの名前を取得します。
+ * @param {number} vmid - VMID
+ * @param {string} type - 'qemu' or 'lxc'
+ * @returns {Promise<string>} VMの名前
+ */
+async function getVMName(vmid, type) {
+  try {
+    if (type === 'qemu') {
+      const config = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/qemu/${vmid}/config`);
+      return config.name || `VM ${vmid}`;
+    } else if (type === 'lxc') {
+      const config = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/lxc/${vmid}/config`);
+      return config.hostname || `CT ${vmid}`;
+    }
+  } catch {
+    return `VM ${vmid}`; // エラー時はデフォルト名
+  }
+}
+
+/**
+ * 指定されたVMIDのアクティブなタスクをすべて強制終了します。
+ * @param {number} vmid - VMID
+ */
+async function killVMTasks(vmid) {
+  try {
+    const tasks = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/tasks?vmid=${vmid}&source=active`);
+    const killed = [];
+    
+    //console.log(`[killVMTasks] Found ${tasks.length || 0} active tasks for VM ${vmid}.`); // デバッグ出力
+
+    for (const task of (tasks || [])) {
+      // ProxmoxのAPIから取得されるアクティブなタスクは、多くの場合 status が 'RUNNING' です。
+      // 'source=active' で取得されるタスクは、基本的に処理を妨げているものとして強制終了の対象とします。
+      // 以前の条件 (task.status === undefined || task.status === '') は、
+      // 実行中のタスクを適切に捕捉できていなかったため削除します。
+      console.warn(`[killVMTasks] Attempting to kill task UPID: ${task.upid}, STATUS: ${task.status} for VM ${vmid}`);
+      
+      try {
+        await proxmoxAPI('DELETE', `/api2/json/nodes/${nodeName}/tasks/${encodeURIComponent(task.upid)}`);
+        killed.push(task.upid);
+        addLog('kill-tasks', `Successfully killed task ${task.upid} for VM ${vmid}.`);
+      } catch (err) {
+        console.warn(`[killVMTasks] Failed to kill task ${task.upid} for VM ${vmid}: ${err.message}`);
+        addLog('kill-tasks', `Failed to kill task ${task.upid} for VM ${vmid}: ${err.message}`, 'error');
+      }
+    }
+    
+    if (killed.length > 0) {
+      addLog('kill-tasks', `VM ${vmid}: ${killed.length} tasks killed: ${killed.join(', ')}`);
+    } else {
+      addLog('kill-tasks', `VM ${vmid}: No active tasks found or none needed killing.`);
+    }
+  } catch (e) {
+    console.error(`[killVMTasks] Error in killVMTasks for VM ${vmid}: ${e.message}`);
+    addLog('kill-tasks', `VM ${vmid} task killing failed: ${e.message}`, 'error');
+  }
+}
+
+/**
+ * VMが停止するまでポーリングで待機し、指定時間内に停止しない場合は強制停止します。
+ * @param {number} vmid - VMID
+ * @param {string} type - 'qemu' or 'lxc'
+ * @param {number} timeoutMs - 停止を待つ最大時間 (ミリ秒)
+ * @returns {Promise<boolean>} 正常に停止したかどうか
+ */
+async function waitForVMToStop(vmid, type, timeoutMs = 30000) {
+  const checkInterval = 2000; // 2秒ごとにチェック
+  let elapsed = 0;
+  while (elapsed < timeoutMs) {
+    try {
+      const status = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/${type}/${vmid}/status/current`);
+      if (status.status === 'stopped') {
+        return true; // 停止した
+      }
+    } catch (e) {
+      // VMが見つからない場合（削除されたなど）は停止したとみなす
+      if (e.message.includes('404')) {
+        return true;
+      }
+      // それ以外のAPIエラーはログに記録するが、続行
+      console.warn(`Error checking status for VM ${vmid}: ${e.message}`);
+    }
+    await new Promise(r => setTimeout(r, checkInterval));
+    elapsed += checkInterval;
+  }
+  // タイムアウトした場合は強制停止を試みる
+  try {
+    addLog('force-stop', `VM ${vmid} did not shut down gracefully within ${timeoutMs / 1000}s, forcing stop.`);
+    // 強制停止前に、現在実行中のシャットダウンタスク（既存のすべてのタスク）を強制終了
+    await killVMTasks(vmid); 
+    await proxmoxAPI('POST', `/api2/json/nodes/${nodeName}/${type}/${vmid}/status/stop`);
+    // 強制停止後、少し待機
+    await new Promise(r => setTimeout(r, 3000));
+    const status = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/${type}/${vmid}/status/current`);
+    return status.status === 'stopped';
+  } catch (e) {
+    console.error(`Failed to force stop VM ${vmid}: ${e.message}`);
+    addLog('force-stop', `VM ${vmid} failed to force stop: ${e.message}`, 'error');
+    return false;
+  }
+}
+
+/**
+ * 起動しようとしているVMとPCIデバイスが競合するVMを検出し、それらをシャットダウン/強制停止します。
+ * @param {number} targetVmid - 起動しようとしているVMのID
+ * @param {string} targetVMType - 起動しようとしているVMのタイプ ('qemu' or 'lxc')
+ * @returns {Promise<Array<{vmid: number, name: string, type: string}>>} 停止した競合VMのリスト
+ */
+async function resolvePCIConflictsAndStopVMs(targetVmid, targetVMType) {
+  addLog('pci-resolve', `Checking PCI conflicts for VM ${targetVmid} (${targetVMType}).`);
+  let targetConfig;
+  try {
+    targetConfig = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/${targetVMType}/${targetVmid}/config`);
+  } catch (e) {
+    throw new Error(`Failed to get config for target VM ${targetVmid}: ${e.message}`);
+  }
+
+  const targetDevices = extractPCIDevices(targetConfig);
+  if (targetDevices.length === 0) {
+    addLog('pci-resolve', `VM ${targetVmid} has no PCI devices, no conflicts to resolve.`);
+    return [];
+  }
+
+  const qemu = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/qemu`);
+  const lxc = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/lxc`);
+  const runningVMs = [
+    ...(qemu || []).filter(v => v.status === 'running').map(v => ({ ...v, type: 'qemu' })),
+    ...(lxc || []).filter(v => v.status === 'running').map(v => ({ ...v, type: 'lxc' }))
+  ].filter(v => v.vmid !== targetVmid); // 自身は競合対象から除外
+
+  const conflictingVMs = new Map(); // vmid -> { name, type, devices: [] }
+
+  for (const vm of runningVMs) {
+    try {
+      const config = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/${vm.type}/${vm.vmid}/config`);
+      const runningDevices = extractPCIDevices(config);
+      for (const td of targetDevices) {
+        for (const rd of runningDevices) {
+          // PCIアドレスのデバイス部分 (例: 0000:01:00.0 の 01:00) が一致するか、
+          // 完全なアドレスが一致するか
+          const tdAddr = td.address.split('.')[0];
+          const rdAddr = rd.address.split('.')[0];
+          if (tdAddr === rdAddr || td.address === rd.address) {
+            if (!conflictingVMs.has(vm.vmid)) {
+              conflictingVMs.set(vm.vmid, { vmid: vm.vmid, name: vm.name || `VM ${vm.vmid}`, type: vm.type });
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(`Could not get config for running VM ${vm.vmid} to check PCI conflicts: ${e.message}`);
+    }
+  }
+
+  const stoppedConflictingVMs = [];
+  if (conflictingVMs.size > 0) {
+    addLog('pci-resolve', `Found conflicts for VM ${targetVmid}. Conflicting VMs: ${Array.from(conflictingVMs.values()).map(v => `${v.name} (${v.vmid})`).join(', ')}`);
+    // 競合するVMをシャットダウン/強制停止
+    for (const [vmid, info] of conflictingVMs.entries()) {
+      addLog('pci-resolve', `Shutting down conflicting VM: ${info.name} (${vmid})`);
+      try {
+        await killVMTasks(vmid); // まずタスクを強制終了
+        await proxmoxAPI('POST', `/api2/json/nodes/${nodeName}/${info.type}/${vmid}/status/shutdown`); // グレースフルシャットダウンを試みる
+        const stopped = await waitForVMToStop(vmid, info.type, 30000); // 30秒待機
+        if (stopped) {
+          addLog('pci-resolve', `Conflicting VM ${info.name} (${vmid}) stopped.`);
+          stoppedConflictingVMs.push(info);
+        } else {
+          addLog('pci-resolve', `Conflicting VM ${info.name} (${vmid}) could not be stopped.`, 'error');
+        }
+      } catch (e) {
+        console.error(`Error stopping conflicting VM ${vmid}: ${e.message}`);
+        addLog('pci-resolve', `Failed to stop conflicting VM ${vmid}: ${e.message}`, 'error');
+      }
+    }
+  }
+  return stoppedConflictingVMs;
+}
+
 // ===== API ROUTES =====
 
 app.get('/api/settings', (req, res) => { res.json(getSettings()); });
@@ -312,14 +515,38 @@ app.get('/api/vm/:vmid/status', async (req, res) => {
 });
 
 app.get('/api/vm/:vmid/pci-conflicts', async (req, res) => {
-  try {
-    const vmid = parseInt(req.params.vmid);
-    let targetConfig;
-    try { targetConfig = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/qemu/${vmid}/config`); }
-    catch { targetConfig = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/lxc/${vmid}/config`); }
+  const vmid = parseInt(req.params.vmid);
+  // console.log(`[PCI Conflicts] Checking conflicts for VMID: ${vmid}`); // デバッグログ
 
+  try {
+    let targetVMInfo;
+    try {
+      targetVMInfo = await getVMInfo(vmid); // getVMInfo を使ってVMのタイプも取得
+      if (!targetVMInfo) {
+        console.warn(`[PCI Conflicts] Target VM ${vmid} not found.`);
+        return res.json({ conflicts: [] });
+      }
+    } catch (e) {
+      console.error(`[PCI Conflicts] Failed to get info for target VM ${vmid}: ${e.message}`);
+      return res.status(500).json({ error: `Failed to get info for target VM ${vmid}: ${e.message}` });
+    }
+
+    let targetConfig;
+    try {
+      // getVMInfo から取得したタイプを使用して設定を取得
+      targetConfig = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/${targetVMInfo.type}/${vmid}/config`);
+    } catch (e) {
+      console.error(`[PCI Conflicts] Failed to get config for target VM ${vmid} (type: ${targetVMInfo.type}): ${e.message}`);
+      return res.status(500).json({ error: `Failed to get config for target VM ${vmid}: ${e.message}` });
+    }
+    
     const targetDevices = extractPCIDevices(targetConfig);
-    if (targetDevices.length === 0) return res.json({ conflicts: [] });
+    // console.log(`[PCI Conflicts] Target VM ${vmid} (${targetVMInfo.type}) has ${targetDevices.length} PCI devices:`, targetDevices.map(d => d.address).join(', ')); // デバッグログ
+
+    if (targetDevices.length === 0) {
+      console.log(`[PCI Conflicts] No PCI devices found for VM ${vmid}. No conflicts.`);
+      return res.json({ conflicts: [] });
+    }
 
     const qemu = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/qemu`);
     const lxc = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/lxc`);
@@ -327,32 +554,48 @@ app.get('/api/vm/:vmid/pci-conflicts', async (req, res) => {
       ...(qemu || []).filter(v => v.status === 'running').map(v => ({ ...v, type: 'qemu' })),
       ...(lxc || []).filter(v => v.status === 'running').map(v => ({ ...v, type: 'lxc' }))
     ].filter(v => v.vmid !== vmid);
+    
+    // console.log(`[PCI Conflicts] Found ${runningVMs.length} running VMs (excluding target VM ${vmid}).`); // デバッグログ
 
     const conflicts = [];
     for (const vm of runningVMs) {
       try {
+        // console.log(`[PCI Conflicts] Checking running VM ${vm.vmid} (${vm.type}) for conflicts.`); // デバッグログ
         const config = await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/${vm.type}/${vm.vmid}/config`);
         const rd = extractPCIDevices(config);
+        // console.log(`[PCI Conflicts] Running VM ${vm.vmid} has ${rd.length} PCI devices:`, rd.map(d => d.address).join(', ')); // デバッグログ
+
         for (const td of targetDevices) {
           for (const r of rd) {
-            if (td.address.split('.')[0] === r.address.split('.')[0] || td.address === r.address) {
-              conflicts.push({ device: td.address, runningVM: vm.vmid, runningVMName: vm.name || `VM ${vm.vmid}`, runningVMType: vm.type });
+            // ここで競合ロジックを再確認
+            // PCIアドレスのデバイス部分 (例: 0000:01:00.0 の 01:00) が一致するか、
+            // 完全なアドレスが一致するか
+            const tdAddrBase = td.address.split('.')[0]; // 例: 0000:01:00
+            const rdAddrBase = r.address.split('.')[0]; // 例: 0000:01:00
+
+            if (tdAddrBase === rdAddrBase || td.address === r.address) {
+              // console.warn(`[PCI Conflicts] CONFLICT DETECTED: Target VM ${vmid} device ${td.address} conflicts with running VM ${vm.vmid} device ${r.address}`); // デバッグログ
+              conflicts.push({ 
+                device: td.address, 
+                runningVM: vm.vmid, 
+                runningVMName: vm.name || `VM ${vm.vmid}`, 
+                runningVMType: vm.type 
+              });
             }
           }
         }
-      } catch {}
+      } catch (innerError) {
+        // VMの設定取得でエラーが発生した場合、これをログに出力する
+        console.error(`[PCI Conflicts] Error checking config for running VM ${vm.vmid} (${vm.type}): ${innerError.message}`);
+        // ただし、このエラーが他のVMのチェックを妨げないように処理は続行
+      }
     }
+    // console.log(`[PCI Conflicts] Final conflicts detected: ${conflicts.length}`); // デバッグログ
     res.json({ conflicts });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/vm/:vmid/start', async (req, res) => {
-  try {
-    const vmid = req.params.vmid, type = req.body.type || 'qemu';
-    const r = await proxmoxAPI('POST', `/api2/json/nodes/${nodeName}/${type}/${vmid}/status/start`);
-    addLog('start', `VM ${vmid} started`);
-    res.json({ ok: true, upid: r });
-  } catch (e) { addLog('start', `VM ${req.params.vmid} failed: ${e.message}`, 'error'); res.status(500).json({ error: e.message }); }
+  } catch (e) { 
+    // console.error(`[PCI Conflicts] Outer API handler error for VM ${vmid}: ${e.message}`); // デバッグログ
+    res.status(500).json({ error: e.message }); 
+  }
 });
 
 app.post('/api/vm/:vmid/shutdown', async (req, res) => {
@@ -482,6 +725,130 @@ app.post('/api/poweroff', async (req, res) => {
 app.get('/api/tasks', async (req, res) => {
   try { res.json(await proxmoxAPI('GET', `/api2/json/nodes/${nodeName}/tasks?source=active&limit=50`) || []); }
   catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ===== NEW API ROUTES =====
+
+// /api/vm/:vmid/force-start-pci-aware に対応
+app.post('/api/vm/:vmid/force-start-pci-aware', async (req, res) => {
+  const { vmid } = req.params;
+  const { type } = req.body; // type もクライアントから受け取る
+
+  let vmName = `VM ${vmid}`;
+  try {
+    const vmInfo = await getVMInfo(parseInt(vmid));
+    if (!vmInfo) {
+      throw new Error(`VM ${vmid} not found.`);
+    }
+    vmName = vmInfo.name;
+
+    addLog('force-start-pci-aware', `Starting process for VM ${vmName} (${vmid})`);
+
+    // 1. アクティブなタスクを強制終了
+    await killVMTasks(parseInt(vmid));
+
+    // 2. PCI競合を解決し、競合するVMを停止
+    const stoppedConflictingVMs = await resolvePCIConflictsAndStopVMs(parseInt(vmid), type);
+    if (stoppedConflictingVMs.length > 0) {
+      addLog('force-start-pci-aware', `VM ${vmid}: Stopped conflicting VMs: ${stoppedConflictingVMs.map(v => `${v.name} (${v.vmid})`).join(', ')}`);
+    }
+
+    // 3. 対象VMを起動
+    await proxmoxAPI('POST', `/api2/json/nodes/${nodeName}/${type}/${vmid}/status/start`);
+    addLog('start', `VM ${vmName} (${vmid}) started successfully.`);
+    res.json({ ok: true, message: `VM ${vmName} started` });
+
+  } catch (e) {
+    const errorMessage = `Failed to force start VM ${vmName} (${vmid}): ${e.message}`;
+    console.error(errorMessage);
+    addLog('force-start-pci-aware', errorMessage, 'error');
+    res.status(500).json({ error: errorMessage });
+  }
+});
+
+// /api/switch-pci-aware に対応
+app.post('/api/switch-pci-aware', async (req, res) => {
+  const { switchIndex, direction } = req.body;
+  const settings = getSettings();
+  const sw = settings.switches[switchIndex];
+
+  if (!sw) {
+    const errorMessage = 'Invalid switch index.';
+    addLog('switch-pci-aware', errorMessage, 'error');
+    return res.status(400).json({ error: errorMessage });
+  }
+
+  const shutdownVmid = direction === 'vm1_to_vm2' ? sw.vm1 : sw.vm2;
+  const startVmid = direction === 'vm1_to_vm2' ? sw.vm2 : sw.vm1;
+
+  let shutdownInfo, startInfo;
+  try {
+    // VM情報を取得 (name, type, statusを含む)
+    // getVMInfo はVMIDが見つからない場合にnullを返す可能性があります
+    const [info1, info2] = await Promise.all([
+      getVMInfo(shutdownVmid),
+      getVMInfo(startVmid)
+    ]);
+
+    if (!info1) {
+      throw new Error(`Shutdown VM ${shutdownVmid} not found in Proxmox.`);
+    }
+    if (!info2) {
+      throw new Error(`Start VM ${startVmid} not found in Proxmox.`);
+    }
+    shutdownInfo = info1;
+    startInfo = info2;
+
+  } catch (e) {
+    const errorMessage = `Failed to get VM info for switch (${shutdownVmid}, ${startVmid}): ${e.message}`;
+    console.error(errorMessage);
+    addLog('switch-pci-aware', errorMessage, 'error');
+    return res.status(400).json({ error: errorMessage });
+  }
+
+  addLog('switch-pci-aware', `Attempting to switch: ${shutdownInfo.name} (${shutdownVmid}) -> ${startInfo.name} (${startVmid})`);
+
+  try {
+    // シャットダウンVMの処理
+    if (shutdownInfo.status === 'running') {
+      addLog('switch-pci-aware', `Shutting down ${shutdownInfo.name} (${shutdownVmid})`);
+      await killVMTasks(shutdownVmid); // タスク強制終了
+      await proxmoxAPI('POST', `/api2/json/nodes/${nodeName}/${shutdownInfo.type}/${shutdownVmid}/status/shutdown`);
+      const stopped = await waitForVMToStop(shutdownVmid, shutdownInfo.type, 30000); // 30秒待機
+      if (!stopped) {
+        addLog('switch-pci-aware', `VM ${shutdownInfo.name} (${shutdownVmid}) failed to stop gracefully, continuing with force stop attempt if necessary.`, 'warning');
+      }
+    } else {
+      addLog('switch-pci-aware', `Shutdown VM ${shutdownInfo.name} (${shutdownVmid}) is already stopped.`);
+    }
+
+    // 起動VMの処理 - PCI競合解決と起動
+    // まず、起動しようとしているVMの既存タスクを強制終了
+    await killVMTasks(startVmid);
+
+    // PCI競合を解決し、競合するVMを停止
+    // ただし、既にシャットダウンしようとしているVMは除外してチェックする
+    const stoppedConflictingVMs = await resolvePCIConflictsAndStopVMs(startVmid, startInfo.type);
+
+    // もし shutdownVmid が stoppedConflictingVMs に含まれていたら除外 (重複ログを避けるため)
+    const finalStoppedConflictingVMs = stoppedConflictingVMs.filter(v => v.vmid !== shutdownVmid);
+
+    if (finalStoppedConflictingVMs.length > 0) {
+      addLog('switch-pci-aware', `For VM ${startVmid}, also stopped conflicting VMs: ${finalStoppedConflictingVMs.map(v => `${v.name} (${v.vmid})`).join(', ')}`);
+    }
+
+    // 対象VMを起動
+    await proxmoxAPI('POST', `/api2/json/nodes/${nodeName}/${startInfo.type}/${startVmid}/status/start`);
+    addLog('start', `VM ${startInfo.name} (${startVmid}) started`);
+
+    res.json({ ok: true, message: `Switch from ${shutdownInfo.name} to ${startInfo.name} completed.` });
+
+  } catch (e) {
+    const errorMessage = `Switch operation failed for (${shutdownVmid} -> ${startVmid}): ${e.message}`;
+    console.error(errorMessage);
+    addLog('switch-pci-aware', errorMessage, 'error');
+    res.status(500).json({ error: errorMessage });
+  }
 });
 
 const PORT = 3000;

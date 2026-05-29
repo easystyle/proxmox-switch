@@ -42,6 +42,7 @@ const i18n = {
     // VM Edit
     vm_edit_title: '{name} - Ayarlar', onboot: 'Start on Boot', onboot_enabled: 'Acilista Baslar',
     onboot_updated: 'Start on boot guncellendi',
+    start_canceled_by_user: 'Kullanici tarafindan baslatma iptal edildi.',
   },
   en: {
     title: 'Proxmox Control',
@@ -81,6 +82,7 @@ const i18n = {
     settings_show_poweroff: 'Show Power Off button', settings_dashboard: 'Dashboard',
     vm_edit_title: '{name} - Settings', onboot: 'Start on Boot', onboot_enabled: 'Start on Boot',
     onboot_updated: 'Start on boot updated',
+    start_canceled_by_user: 'Start canceled by user.',
   }
 };
 
@@ -170,6 +172,7 @@ function renderSwitches() {
   }).join('');
 }
 
+// この関数はオプションから1対1のVM切り替えスイッチを定義してそれを使用したときに呼ばれる。ケバブメニューのstartから呼ばれるのはforceStart()なので注意。
 async function handleSwitch(index, el) {
   if (switchingStates[index]) { el.checked = !el.checked; return; }
   const sw = settings.switches[index];
@@ -178,47 +181,30 @@ async function handleSwitch(index, el) {
   const direction = el.checked ? 'vm1_to_vm2' : 'vm2_to_vm1';
   const shutdownName = el.checked ? (vm1?.name || `VM ${sw.vm1}`) : (vm2?.name || `VM ${sw.vm2}`);
   const startName = el.checked ? (vm2?.name || `VM ${sw.vm2}`) : (vm1?.name || `VM ${sw.vm1}`);
-  const startVmid = el.checked ? sw.vm2 : sw.vm1;
+  // startVmid はサーバー側で計算されるため、クライアント側では直接使用しませんが、
+  // 確認メッセージのために保持しておきます。
+  // const startVmid = el.checked ? sw.vm2 : sw.vm1; // サーバー側のAPIに渡す必要がないため削除
 
-  // PCI conflict check for the VM being started
-  const conflicts = await checkPCIConflicts(startVmid);
-  if (conflicts.length > 0) {
-    // Filter out the VM being shut down (it will be stopped anyway)
-    const shutdownVmid = el.checked ? sw.vm1 : sw.vm2;
-    const realConflicts = conflicts.filter(c => c.runningVM !== shutdownVmid);
-    if (realConflicts.length > 0) {
-      const conflictMap = {};
-      for (const c of realConflicts) {
-        if (!conflictMap[c.runningVM]) conflictMap[c.runningVM] = { name: c.runningVMName, type: c.runningVMType, devices: [] };
-        conflictMap[c.runningVM].devices.push(c.device);
-      }
-      let msg = T('pci_conflict_msg', { name: startName });
-      for (const [vid, info] of Object.entries(conflictMap)) {
-        msg += T('pci_uses_devices', { name: info.name, vmid: vid });
-        msg += info.devices.map(d => `&nbsp;&nbsp;- ${d}`).join('<br>') + '<br><br>';
-      }
-      msg += T('pci_shutdown_question');
-      if (await showPCIConflict(msg) === 'cancel') { el.checked = !el.checked; return; }
-// もしかしたら、複数のVMがこれから立ち上げようとしているVMに必要なリソースを使用していた場合、
-// それらをまとめて事前にシャットダウンを行うのかも？'/api/switch'は1対1のVMしか想定していなかったので、
-// 事前にまとめてシャットダウンする必要性が発生し、このコードを挿入した？
-//      for (const [cVmid, info] of Object.entries(conflictMap)) {
-//        try { await api('POST', `/api/vm/${cVmid}/shutdown`, { type: info.type }); } catch {}
-//      }
-//      await waitForVMsStop(Object.keys(conflictMap).map(Number));
-    }
-  }
-
+  // VMスイッチの確認ダイアログは維持します。
+  // PCI競合の警告はサーバー側で処理されるため、クライアント側からは削除します。
   const ok = await confirm(T('switch_confirm_title'), T('switch_confirm_msg', { shutdown: shutdownName, start: startName }));
   if (!ok) { el.checked = !el.checked; return; }
 
   switchingStates[index] = true;
-  renderSwitches();
+  renderSwitches(); // スイッチの表示を更新し、無効にする
+
+  // サーバー側の新しいAPIを呼び出す
+  // このAPIがシャットダウンVMの処理、起動VMのタスク強制終了、PCI競合解決、VM起動をすべてサーバー側で実行します。
+  toast(T('switching_off', { name: shutdownName }) + ' (server-side processing PCI conflicts and tasks)...', 'info');
   try {
-    await api('POST', '/api/switch', { switchIndex: index, direction });
+    await api('POST', '/api/switch-pci-aware', { switchIndex: index, direction });
     toast(T('switch_done', { shutdown: shutdownName, start: startName }), 'success');
-  } catch (e) { toast(T('switch_error') + ': ' + e.message, 'error'); }
-  finally { switchingStates[index] = false; await loadVMs(); }
+  } catch (e) {
+    toast(T('switch_error') + ': ' + e.message, 'error');
+  } finally {
+    switchingStates[index] = false;
+    await loadVMs(); // VMの状態をリフレッシュ
+  }
 }
 
 // ===== VM List =====
@@ -380,13 +366,52 @@ async function forceStop(vmid, type) {
   setTimeout(loadVMs, 2000);
 }
 
+// ケバブメニューからのStartはこっちの処理
 async function forceStart(vmid, type) {
-  const vm = vms.find(v => v.vmid === vmid); const name = vm ? vm.name : `VM ${vmid}`;
-  if (!await handlePCIConflicts(vmid, name)) return;
-  toast(T('starting', { name }), 'info');
-  try { await killTasksAndWait(vmid); await api('POST', `/api/vm/${vmid}/start`, { type }); toast(T('started', { name }), 'success'); }
-  catch (e) { toast(T('error') + ': ' + e.message, 'error'); }
-  setTimeout(loadVMs, 2000);
+  const vm = vms.find(v => v.vmid === vmid);
+  const name = vm ? vm.name : `VM ${vmid}`;
+
+  // 1. クライアント側でPCI競合をチェック
+  const conflicts = await checkPCIConflicts(vmid);
+  if (conflicts.length > 0) {
+    // 競合がある場合、確認ポップアップを表示
+    const conflictMap = {};
+    for (const c of conflicts) {
+      if (!conflictMap[c.runningVM]) conflictMap[c.runningVM] = { name: c.runningVMName, type: c.runningVMType, devices: [] };
+      conflictMap[c.runningVM].devices.push(c.device);
+    }
+
+    let msg = T('pci_conflict_msg', { name });
+    for (const [vid, info] of Object.entries(conflictMap)) {
+      msg += T('pci_uses_devices', { name: info.name, vmid: vid });
+      msg += info.devices.map(d => `&nbsp;&nbsp;- ${d}`).join('<br>') + '<br><br>';
+    }
+    msg += T('pci_shutdown_question');
+
+    const userAction = await showPCIConflict(msg); // 'shutdown' または 'cancel' が返る
+
+    if (userAction === 'cancel') {
+      toast(T('start_canceled_by_user'), 'info');
+      setTimeout(loadVMs, 2000); // 状態を更新しておく
+      return; // ユーザーがキャンセルしたら処理を中断
+    }
+    // userAction が 'shutdown' の場合、そのまま処理を続行し、
+    // サーバーが競合するVMをシャットダウンすることを期待します。
+  }
+
+  // 2. 競合がない、またはユーザーが続行を決定した場合、サーバー側の新しいAPIを呼び出す
+  // このAPIがPCI競合解決（確認後）、タスク強制終了、VM起動をすべてサーバー側で実行する
+  toast(T('starting', { name }) + ' (server-side processing PCI conflicts and tasks)...', 'info');
+  try {
+    // サーバーAPIには、クライアント側での確認の結果を渡す必要はありません。
+    // サーバーAPIは「force-start-pci-aware」なので、必要に応じて自身で競合VMを停止します。
+    // クライアント側の確認は、あくまでユーザーへの情報提供と意思確認のためです。
+    await api('POST', `/api/vm/${vmid}/force-start-pci-aware`, { type });
+    toast(T('started', { name }), 'success');
+  } catch (e) {
+    toast(T('error') + ': ' + e.message, 'error');
+  }
+  setTimeout(loadVMs, 2000); // VMの状態をリフレッシュ
 }
 
 async function forceRestart(vmid, type) {
