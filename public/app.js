@@ -199,10 +199,13 @@ async function handleSwitch(index, el) {
       }
       msg += T('pci_shutdown_question');
       if (await showPCIConflict(msg) === 'cancel') { el.checked = !el.checked; return; }
-      for (const [cVmid, info] of Object.entries(conflictMap)) {
-        try { await api('POST', `/api/vm/${cVmid}/shutdown`, { type: info.type }); } catch {}
-      }
-      await waitForVMsStop(Object.keys(conflictMap).map(Number));
+// もしかしたら、複数のVMがこれから立ち上げようとしているVMに必要なリソースを使用していた場合、
+// それらをまとめて事前にシャットダウンを行うのかも？'/api/switch'は1対1のVMしか想定していなかったので、
+// 事前にまとめてシャットダウンする必要性が発生し、このコードを挿入した？
+//      for (const [cVmid, info] of Object.entries(conflictMap)) {
+//        try { await api('POST', `/api/vm/${cVmid}/shutdown`, { type: info.type }); } catch {}
+//      }
+//      await waitForVMsStop(Object.keys(conflictMap).map(Number));
     }
   }
 
