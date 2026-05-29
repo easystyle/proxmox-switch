@@ -131,26 +131,30 @@ Open `http://<your-proxmox-ip>:3000` on your phone or any browser on the same ne
 - Auth cookie persists for 1 year — login once on your phone and forget about it
 - Auto-detects the Proxmox node name on startup
 
-### PCI Conflict Detection
+### PCI Conflict Detection (for direct VM Start)
 
-When you tap "Start" on a VM (or use a VM Switch), the panel:
+When you tap "Start" on a VM, the panel:
 
-1. Reads the target VM's config for `hostpci` entries
-2. Reads configs of all currently running VMs
-3. Compares PCI addresses (base address matching, e.g., `01:00` matches `01:00.0`)
-4. If conflicts found → shows a modal listing which VM uses which device
-5. "Shutdown & Start" gracefully shuts down conflicting VMs (with 30s force-stop fallback), then starts your target VM
+1. Client-side checks the target VM's config for hostpci entries against all currently running VMs.
+2. Compares PCI addresses (base address matching, e.g., 01:00 matches 01:00.0).
+3. If conflicts are found → shows a modal listing which VM uses which device and prompts the user for confirmation.
+4. If confirmed, a server-side API (/api/vm/:vmid/force-start-pci-aware) is invoked, which then handles:
+    - Graceful shutdown of conflicting VMs (with 30s force-stop fallback).
+    - Killing any stuck Proxmox tasks that might block operations.
+    - Starting your target VM.
 
 ### VM Switch
 
 Switch toggles let you switch between two pre-configured VMs with one tap:
 
-1. Sends graceful shutdown to the running VM
-2. Waits up to 30 seconds for it to stop
-3. If still running, force stops it
-4. Starts the other VM
-
-You can configure multiple switches and control their visibility from Settings.
+1. The entire VM switching process is fully handled by a single robust server-side API call (/api/switch-pci-aware).
+2. This server-side operation includes:
+    - Graceful shutdown of the currently running VM.
+    - 30-second force-stop fallback if graceful shutdown fails.
+    - Killing any stuck Proxmox tasks that might block operations.
+    - PCI conflict detection and resolution for the target VM (including shutting down conflicting VMs if necessary).
+    - Finally, starting the target VM.
+3. This server-side execution ensures operations complete robustly even if the client browser session is lost during the process.
 
 ### Settings
 
