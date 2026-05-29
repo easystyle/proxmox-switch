@@ -97,9 +97,11 @@ app.use(requireAuth);
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Proxmox config
+// Proxmox API Tokenによる認証
 const PROXMOX_HOST = process.env.PROXMOX_HOST;
 const PROXMOX_USER = process.env.PROXMOX_USER;
-const PROXMOX_PASS = process.env.PROXMOX_PASS;
+const PROXMOX_TOKEN_NAME = process.env.PROXMOX_TOKEN_NAME;
+const PROXMOX_TOKEN_SECRET = process.env.PROXMOX_TOKEN_SECRET;
 const PROXMOX_NODE = process.env.PROXMOX_NODE;
 
 const SETTINGS_FILE = path.join(__dirname, 'settings.json');
@@ -139,19 +141,71 @@ function getSettings() {
 function saveSettings(s) { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2)); }
 
 // ===== PROXMOX API =====
-async function getTicket() {
-  const res = await axios.post(`${PROXMOX_HOST}/api2/json/access/ticket`,
-    `username=${PROXMOX_USER}&password=${PROXMOX_PASS}`,
-    { httpsAgent: agent, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
-  return { ticket: res.data.data.ticket, csrf: res.data.data.CSRFPreventionToken };
-}
-
 async function proxmoxAPI(method, endpoint, data = null) {
-  const auth = await getTicket();
-  const config = { method, url: `${PROXMOX_HOST}${endpoint}`, httpsAgent: agent,
-    headers: { 'Cookie': `PVEAuthCookie=${auth.ticket}`, 'CSRFPreventionToken': auth.csrf } };
-  if (data) config.data = data;
-  return (await axios(config)).data.data;
+  // APIトークン認証に必要な環境変数が設定されているか確認
+  if (!PROXMOX_USER || !PROXMOX_TOKEN_NAME || !PROXMOX_TOKEN_SECRET) {
+    const errorMessage = 'Proxmox API Token credentials (PROXMOX_USER, PROXMOX_TOKEN_NAME, PROXMOX_TOKEN_SECRET) are not fully configured in the environment variables. Please check your .env file.';
+    console.error(errorMessage);
+    // addLog が利用可能なスコープであれば、ログに記録することもできます。
+    // addLog('proxmox-api-auth', errorMessage, 'error');
+    throw new Error(errorMessage);
+  }
+
+  // APIトークンのAuthorizationヘッダーを構築
+  const authHeader = `PVEAPIToken=${PROXMOX_USER}!${PROXMOX_TOKEN_NAME}=${PROXMOX_TOKEN_SECRET}`;
+
+  const config = {
+    method,
+    url: `${PROXMOX_HOST}${endpoint}`,
+    httpsAgent: agent, // 自己署名証明書などに対応
+    headers: {
+      'Authorization': authHeader,
+      // APIトークン認証ではCookieとCSRFPreventionTokenは不要なため削除
+      // 'Cookie': `PVEAuthCookie=${auth.ticket}`,
+      // 'CSRFPreventionToken': auth.csrf,
+      // axiosは`data`プロパティに文字列が渡された場合、自動的に
+      // 'Content-Type': 'application/x-www-form-urlencoded'を設定することが多いため、
+      // ここで明示的に設定する必要は通常ありません。
+    }
+  };
+
+  // POST/PUTリクエストでデータがある場合にdataプロパティを設定
+  if (data) {
+    config.data = data;
+  }
+
+  try {
+    const response = await axios(config);
+    // Proxmox APIからのレスポンスは通常 { data: { data: actual_payload } } の形式なので、
+    // `.data.data` を返すようにします。
+    return response.data.data;
+  } catch (error) {
+    // エラーハンドリングの強化
+    let errorMessage = `Proxmox API Error: ${method} ${endpoint}`;
+    if (error.response) {
+      // サーバーからのエラーレスポンスがある場合 (HTTPステータスコードが2xx以外)
+      errorMessage += ` - Status: ${error.response.status}`;
+      if (error.response.data && error.response.data.message) {
+        errorMessage += ` - Message: ${error.response.data.message}`;
+      } else if (error.response.data && error.response.data.errors) {
+        // Proxmox APIのValidationエラーなどがerrorsフィールドに含まれる場合
+        errorMessage += ` - Errors: ${JSON.stringify(error.response.data.errors)}`;
+      } else if (error.response.data) {
+        // その他のレスポンスデータ
+        errorMessage += ` - Response Data: ${JSON.stringify(error.response.data)}`;
+      }
+    } else if (error.request) {
+      // リクエストは行われたが、レスポンスがなかった場合 (例: ネットワークエラー、Proxmoxサーバーがダウンしているなど)
+      errorMessage += ` - No response received from Proxmox. ${error.message}`;
+    } else {
+      // リクエストの設定中にエラーが発生した場合 (例: configオブジェクトの誤り)
+      errorMessage += ` - Request setup error: ${error.message}`;
+    }
+    console.error(errorMessage);
+    // addLog が利用可能なスコープであれば、ログに記録することもできます。
+    // addLog('proxmox-api', errorMessage, 'error');
+    throw new Error(errorMessage); // エラーを上位にスローして、呼び出し元で適切に処理させる
+  }
 }
 
 let nodeName = PROXMOX_NODE;
