@@ -1,5 +1,7 @@
 # Proxmox Control Panel
 
+### This project is a modified fork of an existing Proxmox control panel, enhanced to use Proxmox API Tokens for improved security and stability.
+
 A lightweight, mobile-friendly web panel for managing Proxmox VE virtual machines — designed for single-PC users who run multiple VMs with GPU passthrough and need to switch between them without a second computer or the Proxmox web UI.
 
 ## Screenshot
@@ -55,6 +57,13 @@ PANEL_USER=admin
 PANEL_PASS=your_password
 SESSION_SECRET=any-random-string-here
 PANEL_LANG=en
+
+# Proxmox API Token Configuration (Required for Proxmox API access)
+PROXMOX_HOST=https://127.0.0.1:8006
+PROXMOX_USER=apiuser@pam # e.g., root@pam or specific_api_user@pam
+PROXMOX_TOKEN_NAME=yourtokenname # The ID of your Proxmox API token
+PROXMOX_TOKEN_SECRET=YOUR_GENERATED_API_TOKEN_SECRET # The secret key of your Proxmox API token
+PROXMOX_NODE=pve # The name of your Proxmox node (e.g., pve, node1)
 EOF
 ```
 
@@ -62,10 +71,16 @@ EOF
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PANEL_USER` | Login username | *(required)* |
-| `PANEL_PASS` | Login password | *(required)* |
-| `SESSION_SECRET` | Secret key for auth token generation | `default-secret` |
-| `PANEL_LANG` | UI language: `en` or `tr` | `en` |
+| 'PANEL_USER' | Login username for this control panel's WebUI | (required) |
+| 'PANEL_PASS' | Login password for this control panel's WebUI | (required) |
+| 'SESSION_SECRET' | Secret key for panel's auth token generation | default-secret |
+| 'PANEL_LANG' | UI language: en or tr | en |
+| 'PROXMOX_HOST' | Proxmox API URL (e.g., https://127.0.0.1:8006) | (required) |
+| 'PROXMOX_USER' | Proxmox API Token user (e.g., root@pam or api_user@pam) | (required) |
+| 'PROXMOX_TOKEN_NAME' | Proxmox API Token ID (e.g., mytoken) | (required) |
+| 'PROXMOX_TOKEN_SECRET' | Proxmox API Token Secret | (required) |
+| 'PROXMOX_NODE' | The name of the Proxmox node | (required) |
+
 
 ### Run Manually
 
